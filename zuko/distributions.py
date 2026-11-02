@@ -13,6 +13,7 @@ __all__ = [
     "TopK",
     "TransformedUniform",
     "Truncated",
+    "vMFNMDistribution",
 ]
 
 import math
@@ -31,6 +32,11 @@ from torch.distributions import (
     constraints,
 )
 from torch.distributions.utils import _sum_rightmost
+
+s_vae_path = "/resnick/groups/enceladus/jyzhao/NormalizingFlows/s-vae-pytorch"
+import sys
+sys.path.append(s_vae_path)
+from hyperspherical_vae.distributions import VonMisesFisher
 
 Distribution._validate_args = False
 Distribution.arg_constraints = {}
@@ -255,6 +261,10 @@ class Mixture(Distribution):
     def event_shape(self) -> Size:
         return self.base.event_shape
 
+    @property
+    def num_components(self) -> int:
+        return len(self.logits)
+
     def expand(self, batch_shape: Size, new: Distribution | None = None) -> Distribution:
         new = self._get_checked_instance(Mixture, new)
         new.base = self.base.expand(batch_shape + self.base.batch_shape[-1:])
@@ -272,7 +282,8 @@ class Mixture(Distribution):
 
         return torch.logsumexp(log_w + log_p, dim=-1)
 
-    def sample(self, shape: Size = ()) -> Tensor:
+    def sample(self, shape: Size = (),
+               return_component_ids: bool = False) -> Tensor:
         with torch.no_grad():
             x = self.base.sample(shape)
             i = Categorical(logits=self.logits).expand(self.batch_shape).sample(shape)
@@ -281,9 +292,18 @@ class Mixture(Distribution):
                 x = x.flatten(0, i.dim() - 1)
                 x = x[torch.arange(i.numel(), device=i.device), i.flatten()]
 
+                if return_component_ids:
+                    return x.reshape(shape + self.batch_shape + self.event_shape), i.reshape(shape + self.batch_shape)
                 return x.reshape(shape + self.batch_shape + self.event_shape)
             else:
+                if return_component_ids:
+                    return x[i], i
                 return x[i]
+
+    def sample_component(self, component: int, shape: Size = ()) -> Tensor:
+        with torch.no_grad():
+            x = self.base.sample(shape)
+            return x[:, component, :]
 
 
 class GeneralizedNormal(Distribution):
@@ -697,3 +717,1051 @@ class Maximum(Minimum):
     def expand(self, batch_shape: Size, new: Distribution | None = None) -> Distribution:
         new = self._get_checked_instance(Maximum, new)
         return super().expand(batch_shape, new)
+
+
+# ============================================================
+# Density helper functions
+# ============================================================
+
+def _log_besseli(nu: float, x: Tensor) -> Tensor:
+    """
+    Compute/approximate log(I_nu(x)).
+
+    Exact stable formulas are used for nu=0 and nu=1/2.
+    For other orders, the approximation from the original code is used.
+    """
+    if torch.any(x <= 0):
+        raise ValueError("x must be strictly positive.")
+
+    # I_0(x)
+    if abs(nu) < 1e-12:
+        return torch.log(torch.special.i0e(x)) + x
+
+    # I_{1/2}(x) = sqrt(2 / (pi*x)) sinh(x)
+    if abs(nu - 0.5) < 1e-12:
+        log_sinh = (
+            x
+            + torch.log(-torch.expm1(-2.0 * x))
+            - math.log(2.0)
+        )
+
+        return (
+            0.5
+            * (
+                math.log(2.0)
+                - math.log(math.pi)
+                - torch.log(x)
+            )
+            + log_sinh
+        )
+
+    if nu < 0:
+        raise ValueError("nu must be nonnegative.")
+
+    # Abramowitz and Stegun 9.7.7 approximation
+    nu_tensor = x.new_tensor(nu)
+
+    frac = x / nu_tensor
+    square = 1.0 + frac.square()
+    root = torch.sqrt(square)
+
+    eta = (
+        root
+        + torch.log(frac)
+        - torch.log1p(root)
+    )
+
+    return (
+        -0.5
+        * torch.log(
+            x.new_tensor(2.0 * math.pi) * nu_tensor
+        )
+        + nu_tensor * eta
+        - 0.25 * torch.log(square)
+    )
+
+
+def _vmf_log_normalizer(
+    kappa: Tensor,
+    dimension: int,
+) -> Tensor:
+    """
+    Log vMF normalizing constant:
+
+        log C_d(kappa)
+
+    where
+
+        C_d(kappa)
+        = kappa^(d/2 - 1)
+          / ((2*pi)^(d/2) I_(d/2 - 1)(kappa)).
+    """
+    d = dimension
+    nu = d / 2.0 - 1.0
+
+    # Uniform density on S^(d-1)
+    uniform_log_normalizer = (
+        torch.special.gammaln(
+            kappa.new_tensor(d / 2.0)
+        )
+        - math.log(2.0)
+        - (d / 2.0) * math.log(math.pi)
+    )
+
+    safe_kappa = kappa.clamp_min(
+        torch.finfo(kappa.dtype).tiny
+    )
+
+    positive_log_normalizer = (
+        nu * torch.log(safe_kappa)
+        - (d / 2.0) * math.log(2.0 * math.pi)
+        - _log_besseli(nu, safe_kappa)
+    )
+
+    return torch.where(
+        kappa > 0,
+        positive_log_normalizer,
+        uniform_log_normalizer,
+    )
+
+
+def _nakagami_log_prob(
+    radius: Tensor,
+    m: Tensor,
+    omega: Tensor,
+) -> Tensor:
+    """
+    Nakagami log-density:
+
+        p(r) =
+            2 m^m / (Gamma(m) omega^m)
+            * r^(2m-1)
+            * exp(-m r^2 / omega)
+    """
+    return (
+        math.log(2.0)
+        + m
+        * (
+            torch.log(m)
+            - torch.log(omega)
+            - radius.square() / omega
+        )
+        + (2.0 * m - 1.0) * torch.log(radius)
+        - torch.special.gammaln(m)
+    )
+
+
+# ============================================================================
+# Batched sampling helpers
+# ============================================================================
+
+def _sample_uniform_sphere(
+    shape: torch.Size,
+    dimension: int,
+    reference: Tensor,
+) -> Tensor:
+    """
+    Sample uniformly from S^(dimension-1).
+
+    Returns
+    -------
+    Tensor
+        Shape: shape + (dimension,)
+    """
+    z = torch.randn(
+        shape + (dimension,),
+        dtype=reference.dtype,
+        device=reference.device,
+    )
+    z[z==0] = torch.finfo(z.dtype).tiny
+
+    return z / torch.linalg.vector_norm(
+        z,
+        dim=-1,
+        keepdim=True,
+    )
+
+
+def _expand_parameter_for_samples(
+    parameter: Tensor,
+    sample_shape: torch.Size,
+) -> Tensor:
+    """
+    Expand a batched parameter over sample dimensions.
+
+    If:
+        parameter.shape == batch_shape
+
+    then the output has shape:
+        sample_shape + batch_shape
+    """
+    leading_ones = (1,) * len(sample_shape)
+
+    return parameter.reshape(
+        leading_ones + parameter.shape
+    ).expand(
+        sample_shape + parameter.shape
+    )
+
+
+def _sample_vmf_base_3d_batched(
+    kappa: Tensor,
+    sample_shape: torch.Size,
+    reference: Tensor,
+) -> Tensor:
+    """
+    Reparameterized vMF samples in three dimensions centered at e_3.
+
+    Parameters
+    ----------
+    kappa
+        Shape: batch_shape
+    sample_shape
+        Requested sample shape.
+    reference
+        Tensor providing device and dtype.
+
+    Returns
+    -------
+    Tensor
+        Shape: sample_shape + batch_shape + (3,)
+    """
+    full_shape = sample_shape + kappa.shape
+
+    kappa_expanded = _expand_parameter_for_samples(
+        kappa,
+        sample_shape,
+    )
+
+    eps = torch.finfo(reference.dtype).eps
+
+    uniform = torch.rand(
+        full_shape,
+        dtype=reference.dtype,
+        device=reference.device,
+    ).clamp(eps, 1.0 - eps)
+
+    # Uniform axial coordinate at kappa=0.
+    a = 2.0 * uniform - 1.0
+
+    small_kappa = kappa_expanded.abs() < 1e-4
+
+    safe_kappa = torch.where(
+        small_kappa,
+        torch.ones_like(kappa_expanded),
+        kappa_expanded,
+    )
+
+    # Exact inverse CDF in d=3:
+    #
+    # w = log((1-u)e^(-kappa) + u e^(kappa)) / kappa
+    log_mixture = torch.logaddexp(
+        torch.log1p(-uniform) - safe_kappa,
+        torch.log(uniform) + safe_kappa,
+    )
+
+    w_exact = log_mixture / safe_kappa
+
+    # Taylor expansion around kappa=0.
+    w_series = (
+        a
+        + 0.5
+        * kappa_expanded
+        * (1.0 - a.square())
+        + kappa_expanded.square()
+        * (a.pow(3) - a)
+        / 3.0
+    )
+
+    w = torch.where(
+        small_kappa,
+        w_series,
+        w_exact,
+    ).clamp(-1.0, 1.0)
+
+    phi = (
+        2.0
+        * math.pi
+        * torch.rand(
+            full_shape,
+            dtype=reference.dtype,
+            device=reference.device,
+        )
+    )
+
+    transverse_radius = torch.sqrt(
+        torch.clamp_min(
+            1.0 - w.square(),
+            0.0,
+        )
+    )
+
+    return torch.stack(
+        (
+            transverse_radius * torch.cos(phi),
+            transverse_radius * torch.sin(phi),
+            w,
+        ),
+        dim=-1,
+    )
+
+
+@torch.no_grad()
+def _sample_vmf_base_rejection_batched(
+    kappa: Tensor,
+    sample_shape: torch.Size,
+    dimension: int,
+    reference: Tensor,
+    *,
+    max_rejection_rounds: int = 10_000,
+) -> Tensor:
+    """
+    Batched exact rejection sampler for vMF distributions centered at e_d.
+
+    Parameters
+    ----------
+    kappa
+        Shape: batch_shape
+    sample_shape
+        Requested sample shape.
+    dimension
+        Event dimension.
+    reference
+        Tensor providing device and dtype.
+
+    Returns
+    -------
+    Tensor
+        Shape: sample_shape + batch_shape + (dimension,)
+    """
+    full_shape = sample_shape + kappa.shape
+
+    kappa_flat = _expand_parameter_for_samples(
+        kappa,
+        sample_shape,
+    ).reshape(-1)
+
+    number_of_samples = kappa_flat.numel()
+    d_minus_1 = float(dimension - 1)
+
+    t1 = torch.sqrt(
+        4.0 * kappa_flat.square()
+        + d_minus_1**2
+    )
+
+    # Stable equivalent of:
+    #
+    # b = (-2*kappa + t1) / (d-1)
+    b = d_minus_1 / (
+        2.0 * kappa_flat + t1
+    )
+
+    x0 = (1.0 - b) / (1.0 + b)
+
+    c = (
+        kappa_flat * x0
+        + d_minus_1
+        * torch.log1p(-x0.square())
+    )
+
+    beta_shape = reference.new_tensor(
+        d_minus_1 / 2.0
+    )
+
+    beta_distribution = Beta(
+        beta_shape,
+        beta_shape,
+    )
+
+    w = reference.new_empty(number_of_samples)
+
+    remaining = torch.arange(
+        number_of_samples,
+        device=reference.device,
+    )
+
+    tiny = torch.finfo(reference.dtype).tiny
+
+    for _ in range(max_rejection_rounds):
+        if remaining.numel() == 0:
+            break
+
+        count = remaining.numel()
+
+        z = beta_distribution.sample((count,))
+
+        uniform = torch.rand(
+            count,
+            dtype=reference.dtype,
+            device=reference.device,
+        ).clamp_min(tiny)
+
+        current_kappa = kappa_flat[remaining]
+        current_b = b[remaining]
+        current_x0 = x0[remaining]
+        current_c = c[remaining]
+
+        candidate_w = (
+            1.0 - (1.0 + current_b) * z
+        ) / (
+            1.0 - (1.0 - current_b) * z
+        )
+
+        test_statistic = (
+            current_kappa * candidate_w
+            + d_minus_1
+            * torch.log1p(
+                -current_x0 * candidate_w
+            )
+            - current_c
+        )
+
+        accepted = (
+            test_statistic >= torch.log(uniform)
+        )
+
+        accepted_indices = remaining[accepted]
+
+        w[accepted_indices] = candidate_w[accepted]
+
+        remaining = remaining[~accepted]
+
+    if remaining.numel() > 0:
+        raise RuntimeError(
+            "The vMF rejection sampler exceeded "
+            f"{max_rejection_rounds} rounds."
+        )
+
+    transverse_direction = _sample_uniform_sphere(
+        torch.Size([number_of_samples]),
+        dimension - 1,
+        reference,
+    )
+
+    transverse_radius = torch.sqrt(
+        torch.clamp_min(
+            1.0 - w.square(),
+            0.0,
+        )
+    )
+
+    base_samples = torch.cat(
+        (
+            transverse_radius.unsqueeze(-1)
+            * transverse_direction,
+            w.unsqueeze(-1),
+        ),
+        dim=-1,
+    )
+
+    return base_samples.reshape(
+        full_shape + (dimension,)
+    )
+
+
+def _rotate_from_last_axis_batched(
+    base_samples: Tensor,
+    mu: Tensor,
+) -> Tensor:
+    """
+    Rotate samples centered at e_d to batched mean directions mu.
+
+    Parameters
+    ----------
+    base_samples
+        Shape:
+            sample_shape + batch_shape + (d,)
+    mu
+        Shape:
+            batch_shape + (d,)
+
+    Returns
+    -------
+    Tensor
+        Shape:
+            sample_shape + batch_shape + (d,)
+    """
+    dimension = mu.shape[-1]
+
+    e_d = mu.new_zeros(dimension)
+    e_d[-1] = 1.0
+
+    tiny = torch.finfo(mu.dtype).tiny
+
+    # Chart 1:
+    #
+    # Q = 2aa^T - I
+    # a = (e_d + mu) / ||e_d + mu||
+    #
+    # This is stable except near mu = -e_d.
+    a = e_d + mu
+
+    a = a / torch.linalg.vector_norm(
+        a,
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(tiny)
+
+    rotated_chart_1 = (
+        2.0
+        * (
+            base_samples * a
+        ).sum(
+            dim=-1,
+            keepdim=True,
+        )
+        * a
+        - base_samples
+    )
+
+    # Chart 2:
+    #
+    # Q = I - 2vv^T / (v^Tv)
+    # v = e_d - mu
+    #
+    # This is stable near mu = -e_d.
+    v = e_d - mu
+
+    denominator = v.square().sum(
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(tiny)
+
+    rotated_chart_2 = (
+        base_samples
+        - 2.0
+        * (
+            base_samples * v
+        ).sum(
+            dim=-1,
+            keepdim=True,
+        )
+        * v
+        / denominator
+    )
+
+    # The branch is used only to select a numerically stable
+    # Householder chart.
+    use_chart_1 = (
+        mu[..., -1:] > -0.5
+    ).detach()
+
+    return torch.where(
+        use_chart_1,
+        rotated_chart_1,
+        rotated_chart_2,
+    )
+
+
+# ============================================================================
+# Batched vMF-Nakagami distribution
+# ============================================================================
+
+class vMFNDistribution(Distribution):
+    """
+    Batched von Mises-Fisher-Nakagami distribution.
+
+    Generative model
+    ----------------
+        U ~ vMF(mu, kappa)
+        R ~ Nakagami(m, omega)
+        X = R U
+
+    Parameter shapes
+    ----------------
+    mu
+        batch_shape + (d,)
+
+    kappa
+        Any shape broadcastable to batch_shape.
+
+    m
+        Any shape broadcastable to batch_shape.
+
+    omega
+        Any shape broadcastable to batch_shape.
+
+    Distribution shapes
+    -------------------
+    batch_shape
+        Broadcasted shape of mu[..., 0], kappa, m, and omega.
+
+    event_shape
+        (d,)
+
+    Reparameterization
+    ------------------
+    dimension == 3:
+        rsample() is differentiable with respect to:
+            mu, kappa, m, omega
+
+    dimension != 3:
+        rsample() is differentiable with respect to:
+            mu, m, omega
+
+        but only when kappa.requires_grad is False.
+    """
+
+    arg_constraints = {
+        "mu": constraints.independent(
+            constraints.real,
+            1,
+        ),
+        "kappa": constraints.nonnegative,
+        "m": constraints.positive,
+        "omega": constraints.positive,
+    }
+
+    support = constraints.independent(
+        constraints.real,
+        1,
+    )
+
+    has_rsample = False
+
+    def __init__(
+        self,
+        mu: Tensor,
+        kappa: Tensor | float,
+        m: Tensor | float,
+        omega: Tensor | float,
+        validate_args: bool | None = None,
+    ):
+        mu = torch.as_tensor(mu)
+
+        if not mu.is_floating_point():
+            mu = mu.float()
+
+        if mu.ndim < 1:
+            raise ValueError(
+                "mu must have shape (..., d)."
+            )
+
+        dimension = mu.shape[-1]
+
+        if dimension < 2:
+            raise ValueError(
+                "The event dimension d must be at least 2."
+            )
+
+        def convert_parameter(
+            value: Tensor | float,
+        ) -> Tensor:
+            return torch.as_tensor(
+                value,
+                dtype=mu.dtype,
+                device=mu.device,
+            )
+
+        kappa = convert_parameter(kappa)
+        m = convert_parameter(m)
+        omega = convert_parameter(omega)
+
+        # The final dimension of mu is the event dimension.
+        mu_batch_shape = mu.shape[:-1]
+
+        batch_shape = torch.broadcast_shapes(
+            mu_batch_shape,
+            kappa.shape,
+            m.shape,
+            omega.shape,
+        )
+
+        # self.batch_shape = batch_shape
+        # self.event_shape = torch.Size([dimension])
+
+        # expand() does not copy data.
+        mu = mu.expand(
+            batch_shape + (dimension,)
+        )
+
+        kappa = kappa.expand(batch_shape)
+        m = m.expand(batch_shape)
+        omega = omega.expand(batch_shape)
+
+        mu_norm = torch.linalg.vector_norm(
+            mu,
+            dim=-1,
+            keepdim=True,
+        )
+
+        if bool(torch.any(mu_norm <= 0)):
+            raise ValueError(
+                "Every mean-direction vector in mu must be nonzero."
+            )
+
+        # Normalize every vector independently.
+        mu = mu / mu_norm
+
+        if bool(torch.any(kappa < 0)):
+            raise ValueError(
+                "Every kappa value must be nonnegative."
+            )
+
+        if bool(torch.any(m <= 0)):
+            raise ValueError(
+                "Every m value must be positive."
+            )
+
+        if bool(torch.any(omega <= 0)):
+            raise ValueError(
+                "Every omega value must be positive."
+            )
+
+        self.mu = mu
+        self.kappa = kappa
+        self.m = m
+        self.omega = omega
+
+        self.dimension = dimension
+
+        # In d=3 the inverse-CDF directional sampler is fully
+        # reparameterized. In other dimensions, kappa must be fixed.
+        self.has_rsample = (
+            dimension == 3
+            or not self.kappa.requires_grad
+        )
+
+        super().__init__(
+            batch_shape=torch.Size(batch_shape),
+            event_shape=torch.Size([dimension]),
+            validate_args=validate_args,
+        )
+
+    def expand(
+        self,
+        batch_shape: torch.Size,
+        _instance=None,
+    ) -> "vMFNDistribution":
+        """
+        Expand the distribution to a new batch shape without copying
+        parameter storage.
+        """
+        batch_shape = torch.Size(batch_shape)
+
+        new = self._get_checked_instance(
+            vMFNDistribution,
+            _instance,
+        )
+
+        new.mu = self.mu.expand(
+            batch_shape + (self.dimension,)
+        )
+
+        new.kappa = self.kappa.expand(batch_shape)
+        new.m = self.m.expand(batch_shape)
+        new.omega = self.omega.expand(batch_shape)
+
+        new.dimension = self.dimension
+
+        new.has_rsample = (
+            new.dimension == 3
+            or not new.kappa.requires_grad
+        )
+
+        super(vMFNDistribution, new).__init__(
+            batch_shape=batch_shape,
+            event_shape=self.event_shape,
+            validate_args=False,
+        )
+
+        new._validate_args = self._validate_args
+
+        return new
+
+    def vmf_log_prob(
+        self,
+        unit_vector: Tensor,
+    ) -> Tensor:
+        """
+        vMF log-density with respect to surface measure.
+
+        Parameters
+        ----------
+        unit_vector
+            Shape:
+                sample_shape + batch_shape + (d,)
+
+        Returns
+        -------
+        Tensor
+            Shape:
+                sample_shape + batch_shape
+        """
+        return (
+            _vmf_log_normalizer(
+                self.kappa,
+                self.dimension,
+            )
+            + self.kappa
+            * (
+                unit_vector * self.mu
+            ).sum(dim=-1)
+        )
+
+    def nakagami_log_prob(
+        self,
+        radius: Tensor,
+    ) -> Tensor:
+        """
+        Nakagami radial log-density.
+
+        Parameters
+        ----------
+        radius
+            Shape:
+                sample_shape + batch_shape
+        """
+        return _nakagami_log_prob(
+            radius,
+            self.m,
+            self.omega,
+        )
+
+    def log_prob_polar(
+        self,
+        value: Tensor,
+    ) -> Tensor:
+        """
+        Log-density with respect to:
+
+            dr d(surface measure)
+
+        This does not include the Cartesian Jacobian.
+        """
+        value = torch.as_tensor(
+            value,
+            dtype=self.mu.dtype,
+            device=self.mu.device,
+        )
+
+        if self._validate_args:
+            self._validate_sample(value)
+
+        radius = torch.linalg.vector_norm(
+            value,
+            dim=-1,
+        )
+
+        safe_radius = radius.clamp_min(
+            torch.finfo(value.dtype).tiny
+        )
+
+        unit_vector = (
+            value / safe_radius.unsqueeze(-1)
+        )
+
+        result = (
+            self.vmf_log_prob(unit_vector)
+            + self.nakagami_log_prob(safe_radius)
+        )
+
+        return torch.where(
+            radius > 0,
+            result,
+            torch.full_like(result, -torch.inf),
+        )
+
+    def log_prob(
+        self,
+        value: Tensor,
+    ) -> Tensor:
+        """
+        Cartesian log-density with respect to dx.
+
+        Because:
+
+            dx = r^(d-1) dr d(surface),
+
+        the Cartesian density includes:
+
+            -(d-1) log(r).
+        """
+        value = torch.as_tensor(
+            value,
+            dtype=self.mu.dtype,
+            device=self.mu.device,
+        )
+
+        radius = torch.linalg.vector_norm(
+            value,
+            dim=-1,
+        )
+
+        safe_radius = radius.clamp_min(
+            torch.finfo(value.dtype).tiny
+        )
+
+        result = (
+            self.log_prob_polar(value)
+            - (self.dimension - 1)
+            * torch.log(safe_radius)
+        )
+
+        return torch.where(
+            radius > 0,
+            result,
+            torch.full_like(result, -torch.inf),
+        )
+
+    def _sample_direction(
+        self,
+        sample_shape: torch.Size,
+        *,
+        reparameterized: bool,
+    ) -> Tensor:
+        if self.dimension == 3:
+            if reparameterized:
+                base_samples = (
+                    _sample_vmf_base_3d_batched(
+                        self.kappa,
+                        sample_shape,
+                        self.mu,
+                    )
+                )
+            else:
+                with torch.no_grad():
+                    base_samples = (
+                        _sample_vmf_base_3d_batched(
+                            self.kappa.detach(),
+                            sample_shape,
+                            self.mu,
+                        )
+                    )
+        else:
+            if (
+                reparameterized
+                and self.kappa.requires_grad
+            ):
+                raise NotImplementedError(
+                    "For dimension != 3, rsample() does not "
+                    "provide an ordinary pathwise derivative "
+                    "with respect to kappa. Detach kappa or use "
+                    "a specialized rejection-sampling gradient "
+                    "estimator."
+                )
+
+            base_samples = (
+                _sample_vmf_base_rejection_batched(
+                    self.kappa.detach(),
+                    sample_shape,
+                    self.dimension,
+                    self.mu,
+                )
+            )
+
+        rotation_mu = (
+            self.mu
+            if reparameterized
+            else self.mu.detach()
+        )
+
+        return _rotate_from_last_axis_batched(
+            base_samples,
+            rotation_mu,
+        )
+
+    def sample(
+        self,
+        sample_shape: torch.Size = torch.Size(),
+    ) -> Tensor:
+        """
+        Non-reparameterized sampling.
+
+        Returns
+        -------
+        Tensor
+            Shape:
+                sample_shape + batch_shape + event_shape
+        """
+        sample_shape = torch.Size(sample_shape)
+
+        with torch.no_grad():
+            # If R ~ Nakagami(m, omega), then:
+            #
+            # R² ~ Gamma(
+            #     concentration=m,
+            #     rate=m/omega
+            # )
+            radius_squared = Gamma(
+                concentration=self.m,
+                rate=self.m / self.omega,
+            ).sample(sample_shape)
+
+            radius = torch.sqrt(radius_squared)
+
+            direction = self._sample_direction(
+                sample_shape,
+                reparameterized=False,
+            )
+
+        return radius.unsqueeze(-1) * direction
+
+    def rsample(
+        self,
+        sample_shape: torch.Size = torch.Size(),
+    ) -> Tensor:
+        """
+        Reparameterized sampling when supported.
+
+        For d=3:
+            gradients propagate through mu, kappa, m, and omega.
+
+        For d!=3 with fixed kappa:
+            gradients propagate through mu, m, and omega.
+        """
+        sample_shape = torch.Size(sample_shape)
+
+        if not self.has_rsample:
+            raise NotImplementedError(
+                "A learnable kappa is currently supported by "
+                "rsample() only when the event dimension is 3. "
+                "For other dimensions, use kappa.detach()."
+            )
+
+        radius_squared = Gamma(
+            concentration=self.m,
+            rate=self.m / self.omega,
+        ).rsample(sample_shape)
+
+        radius = torch.sqrt(radius_squared)
+
+        direction = self._sample_direction(
+            sample_shape,
+            reparameterized=True,
+        )
+
+        return radius.unsqueeze(-1) * direction
+
+    def standard_normal_log_weight(
+        self,
+        value: Tensor,
+    ) -> Tensor:
+        """
+        Importance-sampling log weight:
+
+            log N(value; 0, I) - log q(value)
+        """
+        value = torch.as_tensor(
+            value,
+            dtype=self.mu.dtype,
+            device=self.mu.device,
+        )
+
+        standard_normal_log_prob = (
+            -0.5 * value.square().sum(dim=-1)
+            - 0.5
+            * self.dimension
+            * math.log(2.0 * math.pi)
+        )
+
+        return (
+            standard_normal_log_prob
+            - self.log_prob(value)
+        )
+
+    def likelihood_ratio_log(
+        self,
+        value: Tensor,
+    ) -> Tensor:
+        return self.standard_normal_log_weight(value)

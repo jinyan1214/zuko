@@ -51,12 +51,13 @@ class NSF(MAF):
         context: int = 0,
         bins: int = 8,
         slope: float = 1e-3,
+        bound: float = 5.0,
         **kwargs,
     ) -> None:
         super().__init__(
             features=features,
             context=context,
-            univariate=partial(MonotonicRQSTransform, slope=slope),
+            univariate=partial(MonotonicRQSTransform, slope=slope, bound=bound),
             shapes=[(bins,), (bins,), (bins - 1,)],
             **kwargs,
         )
